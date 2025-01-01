@@ -1,0 +1,28 @@
+{
+  "name": "hazardous-db-bot",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Hazardous Guild DB Bot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "bun run src/index.js",
+    "dev": "bun --watch run src/index.js",
+    "prod": "pm2 start ecosystem.config.cjs",
+    "stop": "pm2 stop hazardous-db-bot",
+    "restart": "pm2 restart hazardous-db-bot",
+    "logs": "pm2 logs hazardous-db-bot",
+    "status": "pm2 status"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "kleur": "^4.1.5",
+    "lodash-es": "^4.17.21",
+    "node-appwrite": "^14.1.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
