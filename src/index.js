@@ -14,7 +14,11 @@ import {
   validateIngameName,
 } from "./utils/ingameName.js";
 import { threadManager } from "./utils/threadManager.js";
-import { withRetry } from "./utils/appwriteHelpers.js";
+import {
+  withRetry,
+  documentCache,
+  batchManager,
+} from "./utils/appwriteHelpers.js";
 import { checkConnections } from "./utils/healthCheck.js";
 
 dotenv.config();
@@ -202,9 +206,12 @@ client.once(Events.ClientReady, async () => {
       offset += limit;
     }
 
-    // Create map from all documents
+    // Create map from all documents and populate cache
     const existingDocsMap = new Map(
-      allDocs.map((doc) => [doc.discord_id, doc])
+      allDocs.map((doc) => {
+        documentCache.set(doc.discord_id, doc);
+        return [doc.discord_id, doc];
+      })
     );
 
     // Process members in batches of 10
@@ -250,10 +257,11 @@ client.once(Events.ClientReady, async () => {
                   ),
                 `Update document for ${member.user.username}`
               );
+              documentCache.set(member.id, { ...existingDoc, ...memberData });
               log.info(`Updated member data for ${member.user.username}`);
             } else {
               memberData.ingame_name = null;
-              await withRetry(
+              const doc = await withRetry(
                 () =>
                   databases.createDocument(
                     process.env.APPWRITE_DATABASE_ID,
@@ -263,6 +271,7 @@ client.once(Events.ClientReady, async () => {
                   ),
                 `Create document for ${member.user.username}`
               );
+              documentCache.set(member.id, doc);
               log.info(`Created new member data for ${member.user.username}`);
             }
           } catch (error) {
@@ -385,37 +394,16 @@ function getOrCreateDebouncedWeaponSync(memberId) {
 // Helper to update specific fields
 async function updateMemberFields(member, fields) {
   try {
-    const existingDoc = await withRetry(
-      () =>
-        databases.listDocuments(
-          process.env.APPWRITE_DATABASE_ID,
-          process.env.APPWRITE_COLLECTION_ID,
-          [Query.equal("discord_id", member.id)]
-        ),
-      `Fetch document for ${member.user.username}`
+    // Queue the update instead of doing it immediately
+    batchManager.queueUpdate(member.id, fields);
+    log.info(
+      `Queued update ${Object.keys(fields).join(", ")} for ${
+        member.user.username
+      }`
     );
-
-    if (existingDoc.documents.length > 0) {
-      await withRetry(
-        () =>
-          databases.updateDocument(
-            process.env.APPWRITE_DATABASE_ID,
-            process.env.APPWRITE_COLLECTION_ID,
-            existingDoc.documents[0].$id,
-            fields
-          ),
-        `Update fields for ${member.user.username}`
-      );
-      log.info(
-        `Updated ${Object.keys(fields).join(", ")} for ${member.user.username}`
-      );
-    } else {
-      // If no document exists, we need to create a full record
-      await syncMember(member);
-    }
   } catch (error) {
     log.error(
-      `Error updating fields for ${member.user.username}: ${error.message}`
+      `Error queueing update for ${member.user.username}: ${error.message}`
     );
   }
 }
@@ -473,27 +461,25 @@ client.on(Events.UserUpdate, async (oldUser, newUser) => {
 client.on(Events.GuildMemberRemove, async (member) => {
   if (member.guild.id === process.env.SERVER_ID && !member.user.bot) {
     try {
-      const existingDoc = await databases.listDocuments(
-        process.env.APPWRITE_DATABASE_ID,
-        process.env.APPWRITE_COLLECTION_ID,
-        [Query.equal("discord_id", member.id)]
-      );
-
-      if (existingDoc.documents.length > 0) {
-        const docId = existingDoc.documents[0].$id;
-        // Preserve historical data but nullify guild-related fields
-        await databases.updateDocument(
-          process.env.APPWRITE_DATABASE_ID,
-          process.env.APPWRITE_COLLECTION_ID,
-          docId,
-          {
-            guild: null,
-            class: null,
-            primary_weapon: null,
-            secondary_weapon: null,
-            has_thread: null,
-          }
+      const existingDoc = documentCache.get(member.id);
+      if (existingDoc) {
+        await withRetry(
+          () =>
+            databases.updateDocument(
+              process.env.APPWRITE_DATABASE_ID,
+              process.env.APPWRITE_COLLECTION_ID,
+              existingDoc.$id,
+              {
+                guild: null,
+                class: null,
+                primary_weapon: null,
+                secondary_weapon: null,
+                has_thread: null,
+              }
+            ),
+          `Update removed member ${member.user.username}`
         );
+        documentCache.invalidate(member.id);
         log.info(
           `Preserved historical data for ${member.user.username} (left server)`
         );
