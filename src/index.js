@@ -327,6 +327,7 @@ const rateLimitedUpdate = async (operation) => {
 // Create maps to store per-member debounced functions
 const memberGuildSyncs = new Map();
 const memberWeaponSyncs = new Map();
+const memberNameSyncs = new Map();
 
 // Create debounced sync function for a specific member
 function getOrCreateDebouncedGuildSync(memberId) {
@@ -392,6 +393,38 @@ function getOrCreateDebouncedWeaponSync(memberId) {
   return memberWeaponSyncs.get(memberId);
 }
 
+// Create debounced sync function for names
+function getOrCreateDebouncedNameSync(memberId) {
+  if (!memberNameSyncs.has(memberId)) {
+    memberNameSyncs.set(
+      memberId,
+      debounce(
+        async (member) => {
+          try {
+            log.info(`Processing name change for ${member.user.username}`);
+            await withRetry(
+              () =>
+                updateMemberFields(member, {
+                  discord_username: member.user.username,
+                  discord_nickname:
+                    member.nickname || member.user.displayName || null,
+                }),
+              `Update names for ${member.user.username}`
+            );
+          } catch (error) {
+            log.error(
+              `Error handling name change for ${member.user.username}: ${error.message}`
+            );
+          }
+        },
+        1000,
+        { maxWait: 5000 }
+      )
+    );
+  }
+  return memberNameSyncs.get(memberId);
+}
+
 // Helper to update specific fields
 async function updateMemberFields(member, fields) {
   try {
@@ -453,7 +486,8 @@ client.on(Events.UserUpdate, async (oldUser, newUser) => {
 
     const member = await server.members.fetch(newUser.id);
     if (member && !member.user.bot) {
-      await debouncedSyncNames(member);
+      const debouncedNameSync = getOrCreateDebouncedNameSync(member.id);
+      await debouncedNameSync(member);
     }
   }
 });
