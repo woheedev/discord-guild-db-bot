@@ -11,7 +11,8 @@
     "stop": "pm2 stop hazardous-db-bot",
     "restart": "pm2 restart hazardous-db-bot",
     "logs": "pm2 logs hazardous-db-bot",
-    "status": "pm2 status"
+    "status": "pm2 status",
+    "test": "bun run src/utils/testAppwrite.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",

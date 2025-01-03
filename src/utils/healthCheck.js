@@ -1,4 +1,5 @@
 import { log } from "./logger.js";
+import { checkDatabaseConnection } from "./appwriteHelpers.js";
 
 export async function checkConnections(client, databases) {
   const status = {
@@ -18,8 +19,7 @@ export async function checkConnections(client, databases) {
 
   // Check Appwrite connection
   try {
-    await databases.listCollections(process.env.APPWRITE_DATABASE_ID);
-    status.appwrite = true;
+    status.appwrite = await checkDatabaseConnection(databases);
   } catch (error) {
     log.error(`Appwrite health check failed: ${error.message}`);
   }

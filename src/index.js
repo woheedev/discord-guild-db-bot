@@ -17,7 +17,7 @@ import { threadManager } from "./utils/threadManager.js";
 import {
   withRetry,
   documentCache,
-  batchManager,
+  createBatchManager,
 } from "./utils/appwriteHelpers.js";
 import { checkConnections } from "./utils/healthCheck.js";
 
@@ -78,6 +78,7 @@ const appwrite = new Appwrite()
   .setKey(process.env.APPWRITE_API_KEY);
 
 const databases = new Databases(appwrite);
+const batchManager = createBatchManager(databases);
 
 // Sync member data to Appwrite
 async function syncMember(member) {
