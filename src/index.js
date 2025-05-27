@@ -1,11 +1,10 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 import { Client as Appwrite, Databases, ID, Query } from "node-appwrite";
 import dotenv from "dotenv";
 import { log } from "./utils/logger.js";
 import { getGuildFromRoles } from "./constants/guilds.js";
 import { getWeaponInfoFromRoles } from "./constants/weapons.js";
 import { debounce } from "lodash-es";
-import http from "http";
 import {
   getIngameName,
   setIngameName,
@@ -19,7 +18,6 @@ import {
   documentCache,
   createBatchManager,
 } from "./utils/appwriteHelpers.js";
-import { checkConnections } from "./utils/healthCheck.js";
 
 dotenv.config();
 
@@ -32,7 +30,6 @@ const requiredEnvVars = [
   "APPWRITE_API_KEY",
   "APPWRITE_DATABASE_ID",
   "APPWRITE_COLLECTION_ID",
-  "HEALTH_PORT",
   "INGAME_NAME_CHANNEL_ID",
   "TANK_REVIEW_CHANNEL_ID",
   "HEALER_REVIEW_CHANNEL_ID",
@@ -99,6 +96,21 @@ async function syncMember(member) {
       );
 
       const hasThread = await threadManager.hasActiveThread(member.id);
+      let threadLink = null;
+      if (hasThread) {
+        const threadId = threadManager.getActiveThreadId(member.id);
+        try {
+          const thread = await member.guild.channels.fetch(threadId);
+          if (thread) {
+            threadLink = `https://discord.com/channels/${member.guild.id}/${thread.id}`;
+          }
+        } catch (error) {
+          log.error(
+            `Error fetching thread for ${member.user.username}: ${error.message}`
+          );
+        }
+      }
+
       const memberData = {
         discord_id: member.id,
         discord_username: member.user.username,
@@ -108,6 +120,7 @@ async function syncMember(member) {
         secondary_weapon: weaponInfo.secondaryWeapon,
         guild: guild,
         has_thread: hasThread,
+        thread_link: threadLink,
       };
 
       if (existingDoc.documents.length > 0) {
@@ -164,6 +177,12 @@ async function syncMember(member) {
 client.once(Events.ClientReady, async () => {
   log.info(`Logged in as ${client.user.tag}`);
 
+  // Set presence to "Is"
+  client.user.setPresence({
+    activities: [{ name: "Is" }],
+    status: "online",
+  });
+
   const server = await client.guilds.fetch(process.env.SERVER_ID);
   if (!server) {
     log.error("Bot is not in the specified Discord server");
@@ -172,6 +191,7 @@ client.once(Events.ClientReady, async () => {
 
   // Initialize thread cache first
   await threadManager.initializeCache(server);
+  log.info("Thread cache initialization completed");
 
   // Create ingame name message in the specified channel
   const ingameNameChannel = await server.channels.fetch(
@@ -182,6 +202,9 @@ client.once(Events.ClientReady, async () => {
   }
 
   try {
+    // Run database audit first
+    await auditDatabaseMembers();
+
     const members = await server.members.fetch();
     const nonBotMembers = Array.from(members.values()).filter(
       (member) => !member.user.bot
@@ -211,6 +234,15 @@ client.once(Events.ClientReady, async () => {
     const existingDocsMap = new Map(
       allDocs.map((doc) => {
         documentCache.set(doc.discord_id, doc);
+        // Validate existing ingame names
+        if (doc.ingame_name !== null) {
+          const validation = validateIngameName(doc.ingame_name);
+          if (!validation.valid) {
+            log.warn(
+              `Invalid ingame name found for ${doc.discord_username}: "${doc.ingame_name}" - ${validation.error}`
+            );
+          }
+        }
         return [doc.discord_id, doc];
       })
     );
@@ -226,6 +258,22 @@ client.once(Events.ClientReady, async () => {
             const guild = getGuildFromRoles(member);
             const weaponInfo = getWeaponInfoFromRoles(member);
             const hasThread = await threadManager.hasActiveThread(member.id);
+
+            let threadLink = null;
+            if (hasThread) {
+              const threadId = threadManager.getActiveThreadId(member.id);
+              try {
+                const thread = await member.guild.channels.fetch(threadId);
+                if (thread) {
+                  threadLink = `https://discord.com/channels/${member.guild.id}/${thread.id}`;
+                }
+              } catch (error) {
+                log.error(
+                  `Error fetching thread for ${member.user.username}: ${error.message}`
+                );
+              }
+            }
+
             const memberData = {
               discord_id: member.id,
               discord_username: member.user.username,
@@ -236,6 +284,7 @@ client.once(Events.ClientReady, async () => {
               secondary_weapon: weaponInfo.secondaryWeapon,
               guild: guild,
               has_thread: hasThread,
+              thread_link: threadLink,
             };
 
             const existingDoc = existingDocsMap.get(member.id);
@@ -303,8 +352,9 @@ client.once(Events.ClientReady, async () => {
 // Event handler for new members
 client.on(Events.GuildMemberAdd, async (member) => {
   if (member.guild.id === process.env.SERVER_ID && !member.user.bot) {
-    // They won't have roles yet, so just log it
     log.info(`New member joined: ${member.user.username}`);
+    // Create document immediately for new members
+    await syncMember(member);
   }
 });
 
@@ -442,14 +492,155 @@ async function updateMemberFields(member, fields) {
   }
 }
 
-// Modify GuildMemberUpdate to use per-member debounced handlers
+// Audit and fix database inconsistencies
+async function auditDatabaseMembers() {
+  const SHOULD_FIX_INCONSISTENCIES = true; // Set to true to enable fixing inconsistencies
+  log.info("Starting database audit...");
+  const server = client.guilds.cache.get(process.env.SERVER_ID);
+  if (!server) {
+    log.error("Bot is not in the specified Discord server");
+    return;
+  }
+
+  try {
+    // Get all current server members
+    const members = await server.members.fetch();
+    const currentMemberIds = new Set(
+      Array.from(members.values())
+        .filter((member) => !member.user.bot)
+        .map((member) => member.id)
+    );
+
+    // Fetch all documents from database
+    const limit = 100;
+    let offset = 0;
+    let allDocs = [];
+
+    while (true) {
+      const response = await databases.listDocuments(
+        process.env.APPWRITE_DATABASE_ID,
+        process.env.APPWRITE_COLLECTION_ID,
+        [Query.limit(limit), Query.offset(offset)]
+      );
+
+      allDocs = allDocs.concat(response.documents);
+
+      if (response.documents.length < limit) break;
+      offset += limit;
+    }
+
+    // Find documents with guild roles for users not in the server
+    const inconsistentDocs = allDocs.filter(
+      (doc) => doc.guild !== null && !currentMemberIds.has(doc.discord_id)
+    );
+
+    if (inconsistentDocs.length > 0) {
+      log.warn(
+        `Found ${inconsistentDocs.length} database entries with guild roles for users not in the server`
+      );
+
+      // Log details of each inconsistency
+      inconsistentDocs.forEach((doc) => {
+        log.warn(
+          `Inconsistent entry found: User ${doc.discord_username} (${doc.discord_id}) has guild "${doc.guild}" but is not in server`
+        );
+      });
+
+      if (SHOULD_FIX_INCONSISTENCIES) {
+        log.info("Fixing inconsistencies...");
+        // Fix inconsistent documents
+        for (const doc of inconsistentDocs) {
+          try {
+            await withRetry(
+              () =>
+                databases.updateDocument(
+                  process.env.APPWRITE_DATABASE_ID,
+                  process.env.APPWRITE_COLLECTION_ID,
+                  doc.$id,
+                  {
+                    guild: null,
+                    class: null,
+                    primary_weapon: null,
+                    secondary_weapon: null,
+                    has_thread: null,
+                  }
+                ),
+              `Fix inconsistent document for user ${doc.discord_username} (${doc.discord_id})`
+            );
+            log.info(
+              `Fixed inconsistent data for ${doc.discord_username} (${doc.discord_id})`
+            );
+          } catch (error) {
+            log.error(
+              `Error fixing data for ${doc.discord_username}: ${error.message}`
+            );
+          }
+        }
+      } else {
+        log.info("Fix mode is disabled. No changes were made to the database.");
+      }
+    } else {
+      log.info("No inconsistencies found in database");
+    }
+  } catch (error) {
+    log.error(`Database audit failed: ${error.message}`);
+  }
+}
+
+// Add audit to daily sync
+async function performDailySync() {
+  log.info("Starting daily sync...");
+  const server = client.guilds.cache.get(process.env.SERVER_ID);
+  if (!server) {
+    log.error("Bot is not in the specified Discord server");
+    return;
+  }
+
+  try {
+    // Run database audit first
+    await auditDatabaseMembers();
+
+    const members = await server.members.fetch();
+    const nonBotMembers = Array.from(members.values()).filter(
+      (member) => !member.user.bot
+    );
+    log.info(
+      `Daily sync: Processing ${nonBotMembers.length} members from ${server.name}`
+    );
+
+    // Process members in batches of 10
+    const batchSize = 10;
+    for (let i = 0; i < nonBotMembers.length; i += batchSize) {
+      const batch = nonBotMembers.slice(i, i + batchSize);
+      await Promise.all(batch.map((member) => syncMember(member)));
+
+      // Add a small delay between batches
+      if (i + batchSize < nonBotMembers.length) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    log.info("Daily sync completed successfully");
+  } catch (error) {
+    log.error(`Daily sync failed: ${error.message}`);
+  }
+}
+
+// Schedule daily sync (runs at 00:00 UTC)
+setInterval(() => {
+  const now = new Date();
+  if (now.getUTCHours() === 0 && now.getUTCMinutes() === 0) {
+    performDailySync();
+  }
+}, 60000); // Check every minute
+
+// Modify GuildMemberUpdate to properly handle role removals
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   if (newMember.guild.id === process.env.SERVER_ID && !newMember.user.bot) {
     try {
       // Check for guild role changes
       const oldGuildRole = getGuildFromRoles(oldMember);
       const newGuildRole = getGuildFromRoles(newMember);
-      if (oldGuildRole !== newGuildRole) {
+      if (oldGuildRole !== newGuildRole || (!oldGuildRole && !newGuildRole)) {
         const debouncedGuildSync = getOrCreateDebouncedGuildSync(newMember.id);
         await debouncedGuildSync(newMember);
       }
@@ -510,6 +701,7 @@ client.on(Events.GuildMemberRemove, async (member) => {
                 primary_weapon: null,
                 secondary_weapon: null,
                 has_thread: null,
+                thread_link: null,
               }
             ),
           `Update removed member ${member.user.username}`
@@ -550,6 +742,7 @@ client.on(Events.GuildBanAdd, async (ban) => {
             primary_weapon: null,
             secondary_weapon: null,
             has_thread: null,
+            thread_link: null,
           }
         );
         log.info(`Preserved historical data for ${ban.user.username} (banned)`);
@@ -577,7 +770,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         log.error(`Error showing ingame name modal: ${error.message}`);
         await interaction.reply({
           content: "Sorry, there was an error. Please try again later.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
@@ -594,7 +787,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!validation.valid) {
           await interaction.reply({
             content: `Invalid in-game name: ${validation.error}`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
           return;
         }
@@ -608,7 +801,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (success) {
           await interaction.reply({
             content: `Your in-game name has been set to: ${validation.value}`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
 
           // Update member data in database
@@ -620,14 +813,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({
             content:
               "Sorry, there was an error setting your in-game name. Please try again later.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
       } catch (error) {
         log.error(`Error handling ingame name modal: ${error.message}`);
         await interaction.reply({
           content: "Sorry, there was an error. Please try again later.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
@@ -651,31 +844,6 @@ client.on("resume", (replayed) => {
 
 client.on("error", (error) => {
   log.error(`Discord client error: ${error.message}`);
-});
-
-const server = http.createServer(async (req, res) => {
-  if (req.url === "/health" && req.method === "GET") {
-    const { healthy, status } = await checkConnections(client, databases);
-    res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ healthy, status }));
-  }
-});
-
-const port = parseInt(process.env.HEALTH_PORT, 10);
-server.listen(port, () => {
-  log.info(`Health check server listening on port ${port}`);
-});
-
-process.on("SIGTERM", async () => {
-  log.info("Received SIGTERM signal, cleaning up...");
-  client.destroy();
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  log.info("Received SIGINT signal, cleaning up...");
-  client.destroy();
-  process.exit(0);
 });
 
 // Thread event handlers with rate limiting
@@ -745,19 +913,14 @@ client.on(Events.ThreadUpdate, async (oldThread, newThread) => {
   }
 });
 
-// Add periodic health check
-const HEALTH_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
-setInterval(async () => {
-  try {
-    const { healthy, status } = await checkConnections(client, databases);
-    if (!healthy) {
-      log.error("Health check failed:", status);
-      if (!status.discord || !status.appwrite) {
-        log.error("Critical service down, restarting...");
-        process.exit(1); // PM2 will restart the process
-      }
-    }
-  } catch (error) {
-    log.error(`Health check error: ${error.message}`);
-  }
-}, HEALTH_CHECK_INTERVAL);
+process.on("SIGTERM", async () => {
+  log.info("Received SIGTERM signal, cleaning up...");
+  client.destroy();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  log.info("Received SIGINT signal, cleaning up...");
+  client.destroy();
+  process.exit(0);
+});

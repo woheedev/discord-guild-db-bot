@@ -135,13 +135,13 @@ export function validateIngameName(name) {
     return { valid: false, error: "Name cannot be longer than 16 characters" };
   }
 
-  // Check for valid characters (letters, numbers, spaces, and common special characters)
-  const validCharRegex = /^[a-zA-Z0-9\s._-]+$/;
+  // Check for valid characters
+  const validCharRegex = /^[^\p{C}\p{Z}\p{M}\p{P}]*$/u;
   if (!validCharRegex.test(trimmedName)) {
     return {
       valid: false,
       error:
-        "Name can only contain letters, numbers, spaces, dots, underscores, and hyphens",
+        "Name cannot contain spaces, punctuation marks, or certain special characters.",
     };
   }
 

@@ -49,6 +49,8 @@ class ThreadManager {
       let totalThreads = 0;
       let errors = 0;
 
+      log.info("Starting thread cache initialization...");
+
       for (const [className, channelInfo] of Object.entries(REVIEW_CHANNELS)) {
         try {
           const channel = await guild.channels.fetch(channelInfo.channelId);
@@ -56,6 +58,8 @@ class ThreadManager {
             log.warn(`Could not find ${className} review channel`);
             continue;
           }
+
+          log.info(`Processing ${className} review channel...`);
 
           const [activeThreads, archivedThreads] = await Promise.all([
             channel.threads.fetchActive().catch((error) => {
@@ -66,6 +70,10 @@ class ThreadManager {
             }),
             this.fetchAllArchivedThreads(channel),
           ]);
+
+          log.info(
+            `Found ${activeThreads.threads.size} active threads and ${archivedThreads.length} archived threads in ${className}`
+          );
 
           const allThreads = [
             ...activeThreads.threads.values(),
@@ -85,16 +93,19 @@ class ThreadManager {
                       thread.guild.members.cache.get(userId)?.user.username ||
                       userId;
                     log.warn(
-                      `User already has an active thread. User: ${username}, ` +
-                        `Old Thread: #${oldThread?.name || oldThreadId} in ${
-                          oldThread?.parent?.name || "unknown"
-                        }, ` +
-                        `New Thread: #${thread.name} in ${
-                          thread.parent?.name || "unknown"
-                        }`
+                      `User already has an active thread. User: ${username}, Old Thread: #${
+                        oldThread?.name || oldThreadId
+                      } in ${
+                        oldThread?.parent?.name || "unknown"
+                      }, New Thread: #${thread.name} in ${
+                        thread.parent?.name || "unknown"
+                      }`
                     );
                   }
                   this.activeThreads.set(userId, thread.id);
+                  log.info(
+                    `Cached active thread for user ${userId}: ${thread.name} (${thread.id})`
+                  );
                   totalThreads++;
                 }
               }
@@ -115,10 +126,18 @@ class ThreadManager {
 
       this.initialized = true;
       log.info(
-        `Thread cache initialized: ${totalThreads} active threads found${
+        `Thread cache initialization completed: ${totalThreads} active threads found${
           errors > 0 ? `, ${errors} errors encountered` : ""
         }`
       );
+
+      // Log the contents of the cache
+      if (totalThreads > 0) {
+        log.info("Active threads cache contents:");
+        for (const [userId, threadId] of this.activeThreads.entries()) {
+          log.info(`User ${userId} -> Thread ${threadId}`);
+        }
+      }
     } catch (error) {
       log.error(`Error initializing thread cache: ${error.message}`);
       throw error;
@@ -226,6 +245,10 @@ class ThreadManager {
     return Object.values(REVIEW_CHANNELS).some(
       (ch) => ch.channelId === channelId
     );
+  }
+
+  getActiveThreadId(userId) {
+    return this.activeThreads.get(userId) || null;
   }
 }
 
